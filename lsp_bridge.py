@@ -211,7 +211,7 @@ class LspBridge:
     @threaded
     def init_remote_file_server(self):
         print("* Running lsp-bridge on remote server. "
-              "Access files with 'lsp-bridge-open-remote-file' or 'find-file /docker:...'")
+              "Access files with 'lsp-bridge-open-remote-file' or 'find-file /docker:...' or 'find-file /nspawn:...")
 
         # Build loop for remote files management.
         self.file_server = FileSyncServer("0.0.0.0", REMOTE_FILE_SYNC_CHANNEL)
@@ -455,6 +455,35 @@ class LspBridge:
                 logger.exception(e)
                 message_emacs(f"Connect {container_user}@{container_name} failed")
                 raise e
+        elif "nspawn:" in tramp_file_name:
+            # nspawn-tramp: https://github.com/bjc/tramp-nspawn
+            # nspawn often requires privileges, multi-hop is required sometimes
+            # /sudo:root@localhosta|nspawn:<username>@<container name>:<file name>
+            tramp_method_split = tramp_method_prefix.rsplit(":", 1)[-1]
+            if "@" in tramp_method_split:
+                container_user, container_name = tramp_method_split.split("@")
+            else:
+                container_user = "root"
+                container_name = tramp_method_split
+
+            # only support local container
+            self.host_names[container_name] = {
+                "server_host": "127.0.0.1",
+                "username": container_user
+            }
+
+            try:
+                tramp_connection_info = tramp_method_prefix + ":"
+                self.remote_sync(container_name, tramp_connection_info)
+                # container_name is used for emacs buffer local variable lsp-bridge-remote-file-host
+                eval_in_emacs("lsp-bridge-update-tramp-file-info", tramp_file_name, tramp_connection_info, tramp_method, container_user, container_name, path)
+                eval_in_emacs("lsp-bridge--setup-tramp-docker-buffer", tramp_file_name)
+                self.sync_tramp_remote_complete_event.set()
+            except Exception as e:
+                logger.exception(e)
+                message_emacs(f"Connect {container_user}@{container_name} failed")
+                raise e
+            
         else:
             message_emacs(
                 f"Failed to access {tramp_file_name}, unsupported tramp methd: {tramp_method_prefix[1:]}, "
@@ -517,11 +546,38 @@ class LspBridge:
                         "command": "open_file",
                         "tramp_method": "docker",
                         "user": container_user,
-                        "server": server_host,
+                        "server": container_name,
                         "port": None,
                         "path": server_path,
                         "jump_define_pos": epc_arg_transformer(jump_define_pos)
                 })
+        elif path.startwith("/nspawn:"):
+            (prefix, path_info, server_path)  = path.rsplit(":", 2)
+            if "@" in path_info:
+                container_user, container_name = path_info.split("@")
+            else:
+                container_user = "root"
+                container_name = path_info
+
+            # only support local container
+            self.host_names[container_name] = {
+                "server_host": "127.0.0.1",
+                "username": container_user
+            }
+            
+            self.remote_sync(container_name, path.rsplit(":", 1)[1] + ":")
+
+            self.send_remote_message(
+                container_name, self.remote_file_sender_queue, {
+                    "command": "open_file",
+                    "tramp_method": "nspawn",
+                    "user": container_user,
+                    "server": container_name,
+                    "port": None,
+                    "path": server_path,
+                    "jump_define_pos": epc_arg_transformer(jump_define_pos)
+                })
+                
         else:
             message_emacs(f"Unsupported remote path {path}")
 
